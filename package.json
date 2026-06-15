@@ -25,7 +25,7 @@
     "@loyal-labs/db-core": "^0.1.1",
     "@loyal-labs/llm-core": "^0.1.1",
     "@loyal-labs/loyal-smart-accounts": "^0.1.1",
-    "@loyal-labs/private-transactions": "^0.2.9",
+    "@loyal-labs/private-transactions": "^0.2.10",
     "@loyal-labs/shared": "^0.1.1",
     "@loyal-labs/smart-account-vaults": "^0.1.1",
     "@loyal-labs/solana-instruction-decoder": "^0.1.1",
