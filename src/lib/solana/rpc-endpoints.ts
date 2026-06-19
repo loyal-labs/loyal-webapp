@@ -17,8 +17,6 @@ const FRONTEND_SOLANA_ENDPOINTS_BY_ENV: Partial<
   },
 };
 
-export function getFrontendSolanaEndpoints(
-  env: SolanaEnv
-): SolanaEndpoints {
+export function getFrontendSolanaEndpoints(env: SolanaEnv): SolanaEndpoints {
   return FRONTEND_SOLANA_ENDPOINTS_BY_ENV[env] ?? getSharedSolanaEndpoints(env);
 }
