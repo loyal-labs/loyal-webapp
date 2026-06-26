@@ -21,7 +21,11 @@ import {
   initialWalletProofState,
   walletProofReducer,
 } from "@/lib/auth/wallet-proof-state";
-import { runWalletProofFlow } from "@/lib/auth/wallet-proof-flow";
+import {
+  runWalletMessageProofFlow,
+  runWalletSiwsProofFlow,
+  runWalletTransactionProofFlow,
+} from "@/lib/auth/wallet-proof-flow";
 import { WalletProofSignerError } from "@/lib/auth/wallet-proof-signer";
 import { useExplicitWalletConnectIntent } from "@/components/solana/wallet-provider";
 
@@ -92,10 +96,12 @@ export function useWalletProofAuth({
   onFlowStart,
   onTurnstileConsumed,
   turnstileToken,
+  useLedgerProof = false,
 }: {
   onFlowStart?: () => void;
   onTurnstileConsumed?: () => void;
   turnstileToken?: string;
+  useLedgerProof?: boolean;
 }) {
   const authApiClient = useAuthApiClient();
   const { refreshSession } = useAuthSession();
@@ -104,9 +110,12 @@ export function useWalletProofAuth({
     connected,
     connecting,
     connect,
+    disconnect,
     publicKey,
     select,
+    signIn,
     signMessage,
+    signTransaction,
     wallet,
     wallets,
   } = useWallet();
@@ -120,6 +129,7 @@ export function useWalletProofAuth({
   const connectAttemptedRef = useRef(false);
   const staleAdapterRecoveryAttemptedRef = useRef(false);
   const selectedWalletNameRef = useRef<WalletName | null>(null);
+  const siwsAttemptedForWalletRef = useRef<string | null>(null);
   const verifyAttemptedForAddressRef = useRef<string | null>(null);
   const [walletNameToReselect, setWalletNameToReselect] =
     useState<WalletName | null>(null);
@@ -133,31 +143,130 @@ export function useWalletProofAuth({
     [wallets]
   );
 
-  const handleFailure = useCallback((error: unknown) => {
-    endExplicitWalletConnect(selectedWalletNameRef.current);
-    const nextError = mapWalletProofError(error);
-    dispatch({
-      type: "failed",
-      status: nextError.status,
-      message: nextError.message,
-      details: nextError.details,
-    });
-  }, [endExplicitWalletConnect]);
+  const handleFailure = useCallback(
+    (error: unknown) => {
+      endExplicitWalletConnect(selectedWalletNameRef.current);
+      const nextError = mapWalletProofError(error);
+      dispatch({
+        type: "failed",
+        status: nextError.status,
+        message: nextError.message,
+        details: nextError.details,
+      });
+    },
+    [endExplicitWalletConnect]
+  );
 
   const recoverStaleSelectedWallet = useCallback(
     (walletName: WalletName) => {
       staleAdapterRecoveryAttemptedRef.current = true;
       connectAttemptedRef.current = false;
+      siwsAttemptedForWalletRef.current = null;
       verifyAttemptedForAddressRef.current = null;
       setWalletNameToReselect(walletName);
-      select(null);
+      void disconnect()
+        .catch(() => undefined)
+        .finally(() => select(null));
     },
-    [select]
+    [disconnect, select]
   );
 
+  const verifySelectedWalletWithSiws = useCallback(async () => {
+    if (!wallet) {
+      handleFailure(new Error("Wallet is not selected."));
+      return;
+    }
+
+    if (!signIn) {
+      handleFailure(
+        new WalletProofSignerError(
+          "This wallet does not support Sign In With Solana.",
+          "wallet_signing_unsupported"
+        )
+      );
+      return;
+    }
+
+    const walletName = wallet.adapter.name;
+    siwsAttemptedForWalletRef.current = walletName;
+    dispatch({ type: "awaiting_signature" });
+
+    try {
+      await runWalletSiwsProofFlow({
+        authApiClient,
+        onStatusChange: (status) => dispatch({ type: status }),
+        signIn,
+        turnstileToken: turnstileTokenRef.current,
+        walletName,
+      });
+      await refreshSession();
+      dispatch({ type: "success" });
+      close();
+    } catch (error) {
+      siwsAttemptedForWalletRef.current = null;
+      handleFailure(error);
+    } finally {
+      endExplicitWalletConnect(selectedWalletNameRef.current);
+      // The Turnstile token is single-use once the challenge consumes it, so
+      // ask the modal to issue a fresh one before any subsequent attempt.
+      onTurnstileConsumedRef.current?.();
+    }
+  }, [
+    authApiClient,
+    close,
+    endExplicitWalletConnect,
+    handleFailure,
+    refreshSession,
+    signIn,
+    wallet,
+  ]);
+
   const verifyConnectedWallet = useCallback(async () => {
+    if (!useLedgerProof && signIn && wallet) {
+      await verifySelectedWalletWithSiws();
+      return;
+    }
+
     if (!connected || !publicKey) {
       handleFailure(new Error("Wallet is not connected."));
+      return;
+    }
+
+    const walletAddress = publicKey.toBase58();
+
+    if (useLedgerProof) {
+      if (!signTransaction) {
+        handleFailure(
+          new WalletProofSignerError(
+            "This wallet does not support transaction signing.",
+            "wallet_signing_unsupported"
+          )
+        );
+        return;
+      }
+
+      verifyAttemptedForAddressRef.current = `transaction:${walletAddress}`;
+
+      try {
+        await runWalletTransactionProofFlow({
+          authApiClient,
+          onStatusChange: (status) => dispatch({ type: status }),
+          signTransaction,
+          turnstileToken: turnstileTokenRef.current,
+          walletAddress,
+        });
+        await refreshSession();
+        dispatch({ type: "success" });
+        close();
+      } catch (error) {
+        verifyAttemptedForAddressRef.current = null;
+        handleFailure(error);
+      } finally {
+        endExplicitWalletConnect(selectedWalletNameRef.current);
+        // The Turnstile token is single-use once the challenge consumes it, so
+        // ask the modal to issue a fresh one before any subsequent attempt.
+        onTurnstileConsumedRef.current?.();
+      }
       return;
     }
 
@@ -171,11 +280,10 @@ export function useWalletProofAuth({
       return;
     }
 
-    const walletAddress = publicKey.toBase58();
-    verifyAttemptedForAddressRef.current = walletAddress;
+    verifyAttemptedForAddressRef.current = `message:${walletAddress}`;
 
     try {
-      await runWalletProofFlow({
+      await runWalletMessageProofFlow({
         authApiClient,
         messageSigner: signMessage,
         onStatusChange: (status) => dispatch({ type: status }),
@@ -202,7 +310,12 @@ export function useWalletProofAuth({
     handleFailure,
     publicKey,
     refreshSession,
+    signIn,
     signMessage,
+    signTransaction,
+    useLedgerProof,
+    verifySelectedWalletWithSiws,
+    wallet,
   ]);
 
   useEffect(() => {
@@ -225,8 +338,45 @@ export function useWalletProofAuth({
 
     const selectedWalletName = selectedWalletNameRef.current;
 
+    if (
+      !useLedgerProof &&
+      wallet?.adapter.name === selectedWalletName &&
+      signIn
+    ) {
+      if (siwsAttemptedForWalletRef.current === wallet.adapter.name) {
+        return;
+      }
+
+      void verifySelectedWalletWithSiws();
+      return;
+    }
+
     if (connected && publicKey) {
       if (selectedWalletName && wallet?.adapter.name !== selectedWalletName) {
+        return;
+      }
+
+      const walletAddress = publicKey.toBase58();
+
+      if (useLedgerProof) {
+        if (!signTransaction) {
+          handleFailure(
+            new WalletProofSignerError(
+              "This wallet does not support transaction signing.",
+              "wallet_signing_unsupported"
+            )
+          );
+          return;
+        }
+
+        if (
+          verifyAttemptedForAddressRef.current ===
+          `transaction:${walletAddress}`
+        ) {
+          return;
+        }
+
+        void verifyConnectedWallet();
         return;
       }
 
@@ -240,7 +390,7 @@ export function useWalletProofAuth({
         return;
       }
 
-      if (verifyAttemptedForAddressRef.current === publicKey.toBase58()) {
+      if (verifyAttemptedForAddressRef.current === `message:${walletAddress}`) {
         return;
       }
 
@@ -284,9 +434,13 @@ export function useWalletProofAuth({
     handleFailure,
     publicKey,
     recoverStaleSelectedWallet,
+    signIn,
     signMessage,
+    signTransaction,
     state.status,
+    useLedgerProof,
     verifyConnectedWallet,
+    verifySelectedWalletWithSiws,
     wallet,
     walletNameToReselect,
   ]);
@@ -366,16 +520,24 @@ export function useWalletProofAuth({
     (walletName: WalletName) => {
       connectAttemptedRef.current = false;
       staleAdapterRecoveryAttemptedRef.current = false;
+      siwsAttemptedForWalletRef.current = null;
       verifyAttemptedForAddressRef.current = null;
       setWalletNameToReselect(null);
       selectedWalletNameRef.current = walletName;
       onFlowStart?.();
 
+      if (!useLedgerProof && wallet?.adapter.name === walletName && signIn) {
+        beginExplicitWalletConnect(walletName);
+        dispatch({ type: "connecting" });
+        void verifySelectedWalletWithSiws();
+        return;
+      }
+
       if (
         wallet?.adapter.name === walletName &&
         connected &&
         publicKey &&
-        signMessage
+        (useLedgerProof ? signTransaction : signMessage)
       ) {
         void verifyConnectedWallet();
         return;
@@ -409,8 +571,12 @@ export function useWalletProofAuth({
       publicKey,
       recoverStaleSelectedWallet,
       select,
+      signIn,
       signMessage,
+      signTransaction,
+      useLedgerProof,
       verifyConnectedWallet,
+      verifySelectedWalletWithSiws,
       wallet,
     ]
   );
@@ -421,6 +587,7 @@ export function useWalletProofAuth({
     connectAttemptedRef.current = false;
     staleAdapterRecoveryAttemptedRef.current = false;
     selectedWalletNameRef.current = null;
+    siwsAttemptedForWalletRef.current = null;
     verifyAttemptedForAddressRef.current = null;
     setWalletNameToReselect(null);
     select(null);
