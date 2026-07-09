@@ -5,7 +5,6 @@ import {
   Stablecoin,
 } from "@loyal-labs/actions";
 import { pda } from "@loyal-labs/loyal-smart-accounts";
-import { createSmartAccountVaultsClient } from "@loyal-labs/smart-account-vaults";
 import type { SolanaEnv } from "@loyal-labs/solana-rpc";
 import { Connection, PublicKey } from "@solana/web3.js";
 
@@ -22,10 +21,7 @@ import { resolveLoyalWebSolanaEnvFromEnv } from "@/lib/core/config/solana-env-ov
 import { getServerSolanaEndpoints } from "@/lib/solana/rpc-endpoints.server";
 import { getFrontendSolanaRpcFetch } from "@/lib/solana/rpc-rate-limit";
 import { hasLiveBalanceSweepTargetForWallet } from "@/lib/yield-optimization/earn-autodeposit-repository.server";
-import {
-  parseEarnDepositPrepareRequestBody,
-  serializePreparedEarnUsdcDeposit,
-} from "@/lib/yield-optimization/earn-deposit-prepare-contracts.shared";
+import { parseEarnDepositPrepareRequestBody } from "@/lib/yield-optimization/earn-deposit-prepare-contracts.shared";
 import { getDeploymentPolicySignerPublicKey } from "@/lib/yield-optimization/deployment-policy-signer.server";
 import { earnReserveTargetFromActivePosition } from "@/lib/yield-optimization/earn-reserve-target.server";
 import {
@@ -34,12 +30,14 @@ import {
   type RoutePolicyRecord,
 } from "@/lib/yield-optimization/yield-deposit-repository.server";
 
-// Mobile twin of `/api/smart-accounts/yield-optimization/deposits/prepare`.
-// Identical prepare logic, but authenticated by a wallet signature (no
-// Turnstile/session) and it resolves/provisions the caller's smart account
-// itself instead of reading it from a session principal. Mobile then signs +
-// sends the returned prepared op with the device wallet. Keep the prepare body
-// below in sync with the session route.
+// Context twin of `../prepare` for ON-DEVICE deposit prepare: same auth,
+// provisioning gate, and DB reads, but instead of building the deposit here
+// (a ~16-RPC-call SDK prepare that contends for this server's shared,
+// per-IP-rate-limited Solana RPC pipe) it returns the inputs so the device
+// runs `prepareEarnUsdcDeposit` on its own RPC/IP allowance — mirroring the
+// on-device autodeposit setup/close flows. `../prepare` stays for app
+// versions that predate on-device prepare; keep the auth/provisioning gate
+// below in sync with it.
 const EARN_DEPOSIT_VAULT_INDEX = 1;
 
 const connectionCache = new Map<SolanaEnv, Connection>();
@@ -131,16 +129,11 @@ export async function POST(request: Request) {
 
   const solanaEnv = getConfiguredSolanaEnv();
   const cluster = resolveLoyalClusterForSolanaEnv(solanaEnv);
-  const connection = getConnection(solanaEnv);
 
   // Resolve (provisioning if needed) the canonical smart account for this
-  // wallet — the same account the web flow uses, so Earn is one position
-  // everywhere. `ensureWalletUserSmartAccount` is idempotent: an account
-  // created on web is reused at no cost. The *first-ever* provisioning is
-  // sponsored (Loyal pays rent), so gate it behind real funds — the wallet must
-  // already hold the USDC it is depositing. This makes free-account spam
-  // economically infeasible (each new account needs a distinct funded wallet)
-  // without depending on Turnstile or external rate-limit infra.
+  // wallet — same gate as `../prepare`: the first-ever provisioning is
+  // sponsored, so require the wallet to already hold the USDC it is
+  // depositing before minting an account for it.
   let settingsPda: string;
   let smartAccountAddress: string;
   try {
@@ -160,7 +153,7 @@ export async function POST(request: Request) {
     } else {
       const usdcMint = getStablecoinMintForCluster(cluster, Stablecoin.USDC);
       const usdcBalanceRaw = await getWalletUsdcBalanceRaw(
-        connection,
+        getConnection(solanaEnv),
         new PublicKey(walletAddress),
         usdcMint
       );
@@ -182,7 +175,7 @@ export async function POST(request: Request) {
     if (isSmartAccountProvisioningError(error)) {
       return jsonError(error.status, error.code, error.message);
     }
-    console.error("[mobile-earn-deposit-prepare] provisioning failed", {
+    console.error("[mobile-earn-deposit-prepare-context] provisioning failed", {
       errorMessage:
         error instanceof Error ? error.message : "Unknown provisioning error.",
       errorName: error instanceof Error ? error.name : typeof error,
@@ -224,39 +217,16 @@ export async function POST(request: Request) {
     ]);
     policy = policyResult?.routePolicy ?? null;
     const policySigner = getDeploymentPolicySignerPublicKey();
-    const client = createSmartAccountVaultsClient({
-      connection,
-      programId,
-    });
-    const yieldRoutingPolicy = policy
-      ? {
-          account: new PublicKey(policy.policyAccount),
-          seed: policy.policySeed,
-          ...(policyResult?.setupPolicy
-            ? {
-                setupPolicy: {
-                  account: new PublicKey(
-                    policyResult.setupPolicy.policyAccount
-                  ),
-                  seed: policyResult.setupPolicy.policySeed,
-                },
-              }
-            : {}),
-        }
-      : undefined;
     // A top-up deposits into the reserve the position is already in (always a
-    // safe USDC reserve), mirroring the session deposit-prepare. The previous
-    // findBestSafeUsdcEarnReserveTarget re-picked the best fresh candidate and
-    // hard-failed ~1-in-5 attempts whenever every safe USDC reserve was
-    // momentarily flagged reserveLastUpdateStale in the Timescale feed.
+    // safe USDC reserve) — same rule as `../prepare`.
     const target =
       policy && activePosition
         ? earnReserveTargetFromActivePosition(activePosition)
         : null;
     // Stray-approval heal, fail-closed: the SPL delegate is load-bearing for
     // sweeps, so the revoke rider is requested only when the wallet provably
-    // has NO live autodeposit target (any settings, duplicates included). On
-    // a gate read error the heal is skipped, never the deposit.
+    // has NO live autodeposit target (any settings, duplicates included). The
+    // SDK re-checks on chain that the delegate is our subscription authority.
     let revokeStrayUsdcDelegate = false;
     try {
       revokeStrayUsdcDelegate =
@@ -264,34 +234,42 @@ export async function POST(request: Request) {
     } catch {
       revokeStrayUsdcDelegate = false;
     }
-    const preparedDeposit = await client.prepareEarnUsdcDeposit({
-      amountRaw,
-      cluster,
-      feePayer: new PublicKey(walletAddress),
-      initializeYieldRoutingPolicy: !policy,
-      policySigner,
-      revokeStrayUsdcDelegate,
-      settingsPda: settings,
-      walletAddress: new PublicKey(walletAddress),
-      ...(target ? { target } : {}),
-      ...(yieldRoutingPolicy ? { yieldRoutingPolicy } : {}),
-    });
     return NextResponse.json({
       cluster,
       programId: serverEnv.loyalSmartAccounts.programId,
       settingsPda,
       smartAccountAddress,
-      preparedDeposit: serializePreparedEarnUsdcDeposit(preparedDeposit),
+      policySigner: policySigner.toBase58(),
+      revokeStrayUsdcDelegate,
+      yieldRoutingPolicy: policy
+        ? {
+            account: policy.policyAccount,
+            seed: policy.policySeed.toString(),
+            setupPolicy: policyResult?.setupPolicy
+              ? {
+                  account: policyResult.setupPolicy.policyAccount,
+                  seed: policyResult.setupPolicy.policySeed.toString(),
+                }
+              : null,
+          }
+        : null,
+      target: target
+        ? {
+            reserve: target.reserve.toBase58(),
+            market: target.market.toBase58(),
+            liquidityMint: target.liquidityMint.toBase58(),
+            supplyApyBps: target.supplyApyBps?.toString() ?? null,
+          }
+        : null,
     });
   } catch (error) {
-    console.error("[mobile-earn-deposit-prepare] prepare failed", {
+    console.error("[mobile-earn-deposit-prepare-context] context failed", {
       amountRaw: amountRaw.toString(),
       cluster,
       errorMessage:
-        error instanceof Error ? error.message : "Unknown prepare error.",
+        error instanceof Error ? error.message : "Unknown context error.",
       errorName: error instanceof Error ? error.name : typeof error,
       policyAccount: policy?.policyAccount ?? null,
-      policySeed: policy?.policySeed.toString() ?? null,
       settings: settingsPda,
       solanaEnv,
       stack: error instanceof Error ? error.stack : undefined,
@@ -299,8 +277,10 @@ export async function POST(request: Request) {
     });
     return jsonError(
       500,
-      "prepare_failed",
-      error instanceof Error ? error.message : "Failed to prepare Earn deposit."
+      "context_failed",
+      error instanceof Error
+        ? error.message
+        : "Failed to resolve Earn deposit context."
     );
   }
 }
