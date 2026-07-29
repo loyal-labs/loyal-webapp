@@ -128,7 +128,7 @@ export const LIFECYCLE_ERROR_CODES = [
   "unexpected_error",
   "invalid_request",
   "unauthenticated",
-  "turnstile_verification_failed",
+  "captcha_verification_failed",
   "wallet_selection_timeout",
   "wallet_connection_timeout",
   // The adapter refused or dropped the connection outright. Distinct from
@@ -185,6 +185,25 @@ export const LIFECYCLE_ERROR_CODES = [
 ] as const;
 export type LifecycleErrorCode = (typeof LIFECYCLE_ERROR_CODES)[number];
 
+// Underlying causes behind a broad `errorCode`. Every value is a token this
+// repo defines — never a string forwarded from a vendor SDK — so nothing a
+// client holds can reach `loyal.error.detail`. Emitters map their native error
+// onto one of these; add a token here when a new cause needs telling apart.
+//
+// `mwa_*` are Mobile Wallet Adapter session failures, whose native codes are
+// EUNSPECIFIED (the module's catch-all), ERROR_WALLET_NOT_FOUND,
+// ERROR_SESSION_TIMEOUT, ERROR_SESSION_CLOSED, "Timed out waiting for local
+// association to be ready", and "Failed to end session".
+export const LIFECYCLE_ERROR_DETAILS = [
+  "mwa_unspecified",
+  "mwa_wallet_not_found",
+  "mwa_session_timeout",
+  "mwa_association_timeout",
+  "mwa_session_closed",
+  "mwa_end_session_failed",
+] as const;
+export type LifecycleErrorDetail = (typeof LIFECYCLE_ERROR_DETAILS)[number];
+
 export const EXECUTE_NOW_STATES = [
   "requested",
   "selected",
@@ -234,6 +253,18 @@ export type LifecycleDiagnostics = {
   chainState?: (typeof CHAIN_STATES)[number];
   cleanupRequired?: boolean;
   errorCode?: LifecycleErrorCode;
+  /**
+   * Which underlying cause produced `errorCode`, for codes that several
+   * distinct causes collapse into — every mobile wallet-session failure, for
+   * instance. Names the cause without minting a lifecycle code per vendor
+   * error.
+   *
+   * An enum, not a string: clients map their native error onto one of the
+   * tokens below and anything else is dropped. Character-level sanitizing
+   * would not do — base58 addresses, JWTs and API keys consist entirely of
+   * token-safe characters, so a free-text field would export them intact.
+   */
+  errorDetail?: LifecycleErrorDetail;
   executeNowState?: ExecuteNowState;
   executionMode?: (typeof EXECUTION_MODES)[number];
   httpStatus?: number;
@@ -338,6 +369,19 @@ function assertOptionalBoolean(
   }
 }
 
+/**
+ * Keep a reported detail only when it is one of our own tokens, else drop it.
+ *
+ * Dropping (rather than rejecting the envelope) because the field only ever
+ * annotates an event, so an unrecognized value must not cost the event it
+ * describes. Matching against the enum (rather than sanitizing characters)
+ * because base58 addresses, JWTs and API keys are made entirely of token-safe
+ * characters and would survive any character filter intact.
+ */
+function normalizeErrorDetail(value: unknown): LifecycleErrorDetail | undefined {
+  return includes(LIFECYCLE_ERROR_DETAILS, value) ? value : undefined;
+}
+
 export function parseBrowserLifecycleEnvelope(
   value: unknown,
   now = Date.now()
@@ -354,6 +398,7 @@ export function parseBrowserLifecycleEnvelope(
     "durationMs",
     "elapsedMs",
     "errorCode",
+    "errorDetail",
     "executeNowState",
     "executionMode",
     "flowId",
@@ -434,6 +479,7 @@ export function parseBrowserLifecycleEnvelope(
   }
 
   assertOptionalEnum(record.errorCode, LIFECYCLE_ERROR_CODES);
+  const errorDetail = normalizeErrorDetail(record.errorDetail);
   assertOptionalEnum(record.executeNowState, EXECUTE_NOW_STATES);
   assertOptionalEnum(record.authProofKind, PROOF_KINDS);
   assertOptionalEnum(record.executionMode, EXECUTION_MODES);
@@ -553,7 +599,9 @@ export function parseBrowserLifecycleEnvelope(
     }
   }
 
-  return { ...record, pathname } as BrowserLifecycleEnvelope;
+  // `errorDetail` always overwrites the raw value; undefined when it was
+  // absent or normalized away, which downstream treats as "not set".
+  return { ...record, pathname, errorDetail } as BrowserLifecycleEnvelope;
 }
 
 const WALLET_ADDRESS_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -637,6 +685,20 @@ export type LifecycleEmitOptions = {
   timestamp?: string;
 };
 
+// crypto.randomUUID only exists in secure contexts (https/localhost); on
+// http LAN dev hosts it is undefined and would crash every flow that starts a
+// tracker. getRandomValues is available everywhere, so derive a canonical v4.
+function fallbackRandomUuidV4(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) =>
+    byte.toString(16).padStart(2, "0")
+  ).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 export function createLifecycleTracker(args: {
   emit: (event: BrowserLifecycleEnvelope) => void;
   flowId?: string;
@@ -649,7 +711,12 @@ export function createLifecycleTracker(args: {
   source?: LifecycleSource;
 }): LifecycleTracker {
   const now = args.now ?? Date.now;
-  const randomUUID = args.randomUUID ?? (() => crypto.randomUUID());
+  const randomUUID =
+    args.randomUUID ??
+    (() =>
+      typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : fallbackRandomUuidV4());
   const flowId = args.flowId ?? randomUUID();
   if (!isCanonicalUuidV4(flowId)) throw new InvalidLifecycleEnvelopeError();
   const createdAt = now();
