@@ -550,7 +550,7 @@ async function verify(): Promise<void> {
   pass("cached pre-fix browser envelopes remain accepted");
 
   const guide = await Bun.file(
-    new URL("../../observability/README.md", import.meta.url)
+    new URL("../../../observability/README.md", import.meta.url)
   ).text();
   for (const value of [
     "bun run --cwd frontend verify:chunk-load-recovery",

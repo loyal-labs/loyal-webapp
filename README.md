@@ -77,7 +77,7 @@ bun run ultracite
 
 ```
 src/
-├── app/              # Next.js app router pages
+├── apps/telegram/              # Next.js app router pages
 ├── components/       # React components
 ├── lib/              # Core libraries and transport helpers
 ├── hooks/           # React hooks
