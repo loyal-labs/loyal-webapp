@@ -1030,8 +1030,6 @@ export type VaultTransferCapability =
   | {
       kind: "settings";
       threshold: number;
-      /** Threshold 1, no time lock, signer can vote and execute. */
-      canExecuteSync: boolean;
       /** Number of wallet signs the user will need to perform. */
       expectedSigns: number;
     }
@@ -5471,19 +5469,11 @@ export function useSmartAccountSidebarData(
 
       if (settingsSigner) {
         const threshold = overview.threshold ?? 1;
-        // One sync execute needs threshold 1, no time lock, and a signer that
-        // can vote and execute. Otherwise threshold-1 falls back to
-        // propose+approve+execute, and threshold>1 only proposes.
-        const canExecuteSync =
-          threshold <= 1 &&
-          overview.timeLock === 0 &&
-          settingsSigner.canVote &&
-          settingsSigner.canExecute;
         return {
           kind: "settings",
           threshold,
-          canExecuteSync,
-          expectedSigns: canExecuteSync || threshold > 1 ? 1 : 3,
+          // threshold-1 needs propose+approve+execute; threshold>1 only proposes.
+          expectedSigns: threshold <= 1 ? 3 : 1,
         };
       }
 
@@ -5607,49 +5597,6 @@ export function useSmartAccountSidebarData(
         }
 
         // capability.kind === "settings"
-        if (capability.canExecuteSync) {
-          const syncOp = isSol
-            ? await client.prepareSolTransferSync({
-                settingsPda,
-                signer: wallet.publicKey,
-                feePayer: wallet.publicKey,
-                destination: recipientPubkey,
-                amountLamports: amountRaw,
-                accountIndex: request.accountIndex,
-              })
-            : await client.prepareSplTransferSync({
-                settingsPda,
-                signer: wallet.publicKey,
-                feePayer: wallet.publicKey,
-                mint: new PublicKey(request.mint),
-                destinationOwner: recipientPubkey,
-                amount: amountRaw,
-                decimals,
-                accountIndex: request.accountIndex,
-                createDestinationAta: true,
-              });
-          const syncSignature = await sendPreparedWithWallet({
-            connection,
-            wallet: walletBridge,
-            prepared: syncOp,
-            confirm: true,
-          });
-          queueMutationRefresh(
-            resolveSmartAccountMutationRefreshPlan({
-              kind: "vault_transfer",
-              execution: "settings",
-              accountIndex: request.accountIndex,
-              signerAddresses: [request.recipientAddress],
-            }),
-            "post-transfer"
-          );
-          return {
-            success: true,
-            signature: syncSignature,
-            status: "executed",
-          };
-        }
-
         const proposeOp = isSol
           ? await client.prepareSolTransferProposal({
               settingsPda,
@@ -5822,43 +5769,6 @@ export function useSmartAccountSidebarData(
             connection,
             transaction: request.transaction,
           });
-        const threshold = overview.threshold ?? 1;
-        const syncOp =
-          threshold <= 1 &&
-          overview.timeLock === 0 &&
-          settingsSigner.canVote &&
-          settingsSigner.canExecute
-            ? await client.prepareCustomInstructionSync({
-                settingsPda,
-                signer: wallet.publicKey,
-                feePayer: wallet.publicKey,
-                instructions,
-                accountIndex: request.accountIndex,
-                addressLookupTableAccounts,
-              })
-            : null;
-        if (syncOp) {
-          const syncSignature = await sendPreparedWithWallet({
-            connection,
-            wallet: walletBridge,
-            prepared: syncOp,
-            confirm: true,
-          });
-          queueMutationRefresh(
-            resolveSmartAccountMutationRefreshPlan({
-              kind: "vault_swap",
-              execution: "executed",
-              accountIndex: request.accountIndex,
-            }),
-            "post-swap"
-          );
-          return {
-            success: true,
-            signature: syncSignature,
-            status: "executed",
-          };
-        }
-
         const preparedProposal = await client.prepareCustomInstructionProposal({
           settingsPda,
           creator: wallet.publicKey,
@@ -5873,6 +5783,7 @@ export function useSmartAccountSidebarData(
           prepared: preparedProposal,
           confirm: true,
         });
+        const threshold = overview.threshold ?? 1;
 
         if (threshold > 1) {
           queueMutationRefresh(
