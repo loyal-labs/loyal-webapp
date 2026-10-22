@@ -11,10 +11,6 @@ import {
 } from "@solana/web3.js";
 
 import {
-  VoltrClaimLiquidityError,
-  voltrClaimPlan,
-} from "../src/features/earn-max/voltr/plans";
-import {
   readVoltrPosition,
   VOLTR_ASSET_MINT,
   VOLTR_IDLE_ATA,
@@ -22,8 +18,10 @@ import {
   VOLTR_LP_MINT,
   VOLTR_VAULT,
   voltrClaimBlockReason,
+  VoltrClaimLiquidityError,
+  voltrClaimPlan,
   voltrUserAccounts,
-} from "../src/features/earn-max/voltr/program";
+} from "@loyal-labs/smart-account-vaults";
 import { normalizeLifecycleErrorCode } from "../src/features/observability/lifecycle-contract";
 
 // Synthetic account snapshots only. No network connection, signing or secrets.
@@ -63,11 +61,13 @@ const accounts = new Map<string, AccountInfo<Buffer>>([
   [user.receipt.toBase58(), account(receipt)],
 ]);
 const connection = {
-  getMultipleAccountsInfo: async (keys: PublicKey[]) =>
-    keys.map((key) =>
+  getMultipleAccountsInfoAndContext: async (keys: PublicKey[]) => ({
+    context: { slot: 1 },
+    value: keys.map((key) =>
       key.equals(VOLTR_IDLE_ATA) ? idle : accounts.get(key.toBase58()) ?? null
     ),
-} as Connection;
+  }),
+} as unknown as Connection;
 const context = { authority, owner };
 
 const funded = await readVoltrPosition(connection, authority);
@@ -128,7 +128,7 @@ assert.equal(
 );
 await assert.rejects(voltrClaimPlan(connection, context), /not claimable yet/);
 const failedRead = {
-  getMultipleAccountsInfo: async () => {
+  getMultipleAccountsInfoAndContext: async () => {
     throw new Error("Read unavailable");
   },
 } as unknown as Connection;

@@ -1,9 +1,9 @@
 # Mirror Source
 
-This repository is generated from `loyal-labs/loyal-app`.
+This repository is generated from `loyal-labs/loyal-yield-routing`.
 
-- Source path: `apps/web`
-- Source commit: `3c54549019ae1f299fa725b1d401029a8a488661`
-- Generated at: `2026-10-22T18:33:37.942Z`
+- Source path: `web/apps/web`
+- Source commit: `f22f2dff351dcda3648ab857d261d07c272c1ad2`
+- Generated at: `2026-10-22T19:24:38.349Z`
 
-Do not edit this repository directly. Changes should land in `loyal-app`.
+Do not edit this repository directly. Changes should land in `loyal-yield-routing/web`.

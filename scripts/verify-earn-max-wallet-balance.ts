@@ -14,7 +14,7 @@ mock.module("@/lib/solana/rpc-rate-limit", () => ({
 }));
 
 const { VOLTR_ASSET_MINT } = await import(
-  "../src/features/earn-max/voltr/program"
+  "@loyal-labs/smart-account-vaults"
 );
 const { readEarnMaxWalletUsdcBalance } = await import(
   "../src/features/earn-max/voltr/summary.server"
